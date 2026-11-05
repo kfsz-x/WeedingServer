@@ -35,6 +35,9 @@ function attach(server,{authorizeSubscription=()=>false,maxPayload=16*1024*1024}
  }
  const updated=room=>{for(const socket of wss.clients)if(socket.subscription&&socket.subscription.room===room)void push(socket);};
  server.on('room-updated',updated);
- return {close(){server.off('upgrade',upgrade);server.off('room-updated',updated);for(const socket of wss.clients)socket.terminate();wss.close();}};
+ const shutdown=()=>{for(const socket of wss.clients)send(socket,{type:'push',status:200,body:JSON.stringify({ok:false,code:'SERVER_SHUTDOWN',error:'服务器已关闭，已返回离线模式'})});};
+ const stop=()=>{for(const socket of wss.clients)socket.close(1001,'Server shutdown');};
+ server.on('server-shutdown',shutdown);server.on('shutdown-sockets',stop);
+ return {close(){server.off('server-shutdown',shutdown);server.off('shutdown-sockets',stop);server.off('upgrade',upgrade);server.off('room-updated',updated);for(const socket of wss.clients)socket.terminate();wss.close();}};
 }
 module.exports={attach};

@@ -7,12 +7,22 @@ const {SnapshotArchive}=require('./snapshot-transfer.cjs');
 const {enqueueCommand}=require('./movement-queue.cjs');
 const {attach}=require('./room-websocket.cjs');
 const {decodeWorldInput}=require('./world-upload.cjs');
+const {CapacityGuard}=require('./capacity.cjs');
+const networkMode=process.env.WEEDING_MODE||'local';
+if(!['local','online'].includes(networkMode))throw Error('WEEDING_MODE must be local or online');
+const capacity=new CapacityGuard(Object.fromEntries([['maxRooms','WEEDING_MAX_ROOMS'],['maxPlayers','WEEDING_MAX_PLAYERS'],['maxRssMb','WEEDING_MAX_RSS_MB'],['maxCpu','WEEDING_MAX_CPU_PERCENT'],['maxLagMs','WEEDING_MAX_LAG_MS']].filter(([,name])=>process.env[name]!==undefined).map(([key,name])=>[key,Number(process.env[name])])));
+let shuttingDown=false;
 const snapshots=new SnapshotArchive();
 const requestCounts = new Map();
 const rooms = new Map();
 const port = Number(process.env.WEEDING_PORT || 8788);
 function key() { return crypto.randomBytes(24).toString('hex'); }
-function failure(message) { throw new Error(message); }
+function failure(message,code) { const error=new Error(message);error.code=code;throw error; }
+function population(){let players=0,count=0;const now=Date.now();for(const room of rooms.values()){if(now-room.lastHost>15000)continue;count++;players++;for(const guest of room.guests.values())if(now-guest.seen<=15000)players++;}return {rooms:count,players};}
+function admit(action,data){
+ if(data.networkMode&&data.networkMode!==networkMode)failure('房间模式不匹配，请选择正确的本地或线上标签','MODE_MISMATCH');
+ if(networkMode==='online'){const p=population(),reason=capacity.reason(action,p.rooms,p.players);if(reason)failure('线上服务器繁忙，请使用本地联机或稍后重试',reason);}
+}
 function fullWorld(room,code,support){
  const world=room.state.snapshot();
  return support&&Buffer.byteLength(world)>65536?{snapshot:snapshots.describe(code,world,room.revision)}:{world};
@@ -34,7 +44,7 @@ const server = http.createServer(async (req, res) => {
     }))}));return;
   }
   if(req.method==='GET' && req.url==='/health') {
-    res.end(JSON.stringify({ok:true,protocol:10,rooms:rooms.size,requests:Object.fromEntries(requestCounts)}));return;
+    res.end(JSON.stringify({ok:!shuttingDown,protocol:10,networkMode,rooms:rooms.size,capacity:{...population(),limits:capacity.limits,metrics:capacity.metrics,overloaded:capacity.overloaded,shuttingDown},requests:Object.fromEntries(requestCounts)}));return;
   }
   if(req.method==='GET' && req.url==='/debug.rpk') {
     const file=path.resolve(__dirname,'../../../VivoDebug/webgl_vivo/dist/com.application.demo.minigame.rpk');
@@ -58,6 +68,7 @@ const server = http.createServer(async (req, res) => {
     }
     const raw=Buffer.concat(chunks).toString('utf8');
     const data = JSON.parse(raw);
+    if(shuttingDown&&req.url!=='/close')failure('服务器已关闭，已返回离线模式','SERVER_SHUTDOWN');
     let room = rooms.get(data.room);
     let result = {};
     switch (req.url) {
@@ -68,6 +79,7 @@ const server = http.createServer(async (req, res) => {
         result.ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
         break;
       case '/create': {
+        admit('create',data);
         if(data.protocol!==10)failure('游戏版本不匹配，请更新游戏后重新开房（房间协议10）');
         let code;
         do { code = String(crypto.randomInt(100000, 1000000)); } while (rooms.has(code));
@@ -78,6 +90,7 @@ const server = http.createServer(async (req, res) => {
         break;
       }
       case '/join': {
+        admit('join',data);
         if(data.protocol!==10)failure('游戏版本不匹配，请更新游戏后加入房间（房间协议10）');
         if (!room || Date.now() - room.lastHost > 15000) failure('房间不存在或房主已离线');
         if (room.guests.size >= 3) failure('房间已满');
@@ -182,15 +195,24 @@ const server = http.createServer(async (req, res) => {
         if(token!==data.token && guest.pose && Date.now()-guest.seen<15000) result.peers.push({id:guest.id,playerId:guest.playerId,activeSeconds:guest.activeSeconds,...guest.pose});
     }
     if(['/create','/join','/close'].includes(req.url))console.log(new Date().toISOString(),req.socket.remoteAddress,req.url,'ok');
-    res.end(JSON.stringify({ ok: true, protocol:10, ...result }));
+    res.end(JSON.stringify({ ok: true, protocol:10, networkMode, ...result }));
   } catch (error) {
     console.log(new Date().toISOString(),req.socket.remoteAddress,req.url,error.message);
     // Game errors stay in JSON because some mini-game transports discard HTTP error bodies.
-    res.statusCode = 200; res.end(JSON.stringify({ ok: false, error: error.message }));
+    res.statusCode = 200; res.end(JSON.stringify({ ok: false, error: error.message, code:error.code }));
   }
 });
 server.listen(port, '0.0.0.0', () => console.log('Weeding LAN relay listening on ' + port));
 if(process.env.WEEDING_DISABLE_WS!=='1')attach(server,{authorizeSubscription:(code,token)=>!!rooms.get(code)?.guests.has(token)});
+let previousCpu=process.cpuUsage(),previousTime=performance.now();
+setInterval(()=>{const now=performance.now(),elapsed=now-previousTime,cpu=process.cpuUsage(previousCpu);previousCpu=process.cpuUsage();previousTime=now;capacity.sample({rssMb:process.memoryUsage().rss/1048576,cpu:(cpu.user+cpu.system)/1000/elapsed*100,lagMs:Math.max(0,elapsed-1000)});},1000).unref();
+function beginShutdown(){
+ if(shuttingDown)return;shuttingDown=true;server.emit('server-shutdown');
+ console.log('Weeding server draining: notifying connected clients');
+ setTimeout(()=>{server.emit('shutdown-sockets');server.close(()=>process.exit(0));setTimeout(()=>process.exit(0),2000).unref();},5000);
+}
+process.on('SIGTERM',beginShutdown);process.on('SIGINT',beginShutdown);
+module.exports={beginShutdown};
 setInterval(() => {
   for (const [code, room] of rooms) {
     if (Date.now() - room.lastHost > 15000){rooms.delete(code);snapshots.drop(code);}
