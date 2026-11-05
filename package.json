@@ -1,0 +1,17 @@
+{
+  "name": "WeedingServer",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test",
+    "start": "node --env-file-if-exists=.env server.cjs"
+  },
+  "dependencies": {
+    "ws": "^8.22.1"
+  },
+  "private": true,
+  "description": "Weeding room server and protocol regression tests",
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=WeedingServer room relay
+After=network.target
+
+[Service]
+Type=simple
+User=weedingserver
+Group=weedingserver
+WorkingDirectory=/opt/WeedingServer
+EnvironmentFile=-/etc/WeedingServer.env
+ExecStart=/usr/bin/node server.cjs
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
