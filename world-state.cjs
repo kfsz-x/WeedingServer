@@ -46,6 +46,13 @@ class RoomWorld {
   let tools=patch.tools||this.data.tools,progress=patch.progress||this.data.progress;
   if((patch.sections&128)!==0)tools=applyToolChanges(tools,patch.toolChanges);
   if((patch.sections&256)!==0)progress=applyProgressChanges(progress,patch.progressChanges);
+  let economy=this.data.economy;
+  if((patch.sections&512)!==0){
+   economy=patch.economy;
+   if(!economy||typeof economy.shared!=='boolean'||!Array.isArray(economy.wallets)||economy.wallets.length>4)throw Error('无效经济状态');
+   const actors=new Set();for(const w of economy.wallets){if(!w||typeof w.actor!=='string'||!w.actor||actors.has(w.actor)||!Number.isSafeInteger(w.coins)||w.coins<0||w.coins>2147483647)throw Error('无效钱包');actors.add(w.actor);}
+   if(!actors.has('host'))throw Error('缺少房主钱包');
+  }
   const removed=patch.removed||[],plants=patch.plants||[];
   if(!Array.isArray(removed)||!Array.isArray(plants))throw new Error('无效植物增量');
   for(const id of removed)if(!Number.isSafeInteger(id)||id<0)throw new Error('无效植物ID');
@@ -56,6 +63,7 @@ class RoomWorld {
   if(Number.isInteger(patch.merchantSaleSequence)){this.data.merchantSaleSequence=patch.merchantSaleSequence;this.data.merchantSales=patch.merchantSales||[];}
   if(tools)this.data.tools=tools;if(progress)this.data.progress=progress;
   if(bundles)this.data.bundles=bundles;
+  if(economy)this.data.economy=economy;
   this.areas=areas;
   for(const {change,records} of areaJobs){
    areas.header.currentArea=change.currentArea;areas.header.uniquePulls=change.uniquePulls;

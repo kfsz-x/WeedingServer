@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Weeding · 房间管理</title><link rel="stylesheet" href="/admin/style.css"><script src="/admin/app.js" defer></script></head>
+<body>
+<header class="top"><a class="brand" href="/admin"><span class="brand-icon">W</span><span>WEEDING<small>服务器控制台</small></span></a><div class="top-right"><span id="connection" class="connection">尚未登录</span><button id="logout" class="ghost" hidden>退出登录</button></div></header>
+<main>
+ <div class="page-title"><div><p class="eyebrow">MULTIPLAYER OPERATIONS</p><h1>房间管理</h1><p class="subtle">查看在线玩家与房间用量，让每一场合作保持顺畅。</p></div><div class="refresh-area"><span id="updated">等待连接服务器</span><button id="refresh" class="secondary" disabled>↻ 刷新</button></div></div>
+ <div id="message" class="message" role="status" hidden></div>
+ <section id="overview" class="overview" aria-label="服务器概况" hidden></section>
+ <section id="resource" class="resource" aria-label="资源监控" hidden></section>
+ <section class="rooms-panel" id="room-panel" hidden>
+  <div class="section-head"><div><h2>实时房间 <span id="room-count" class="count">0</span></h2><p class="subtle">每 3 秒自动刷新 · 每间最多 4 人</p></div><label class="search"><span>⌕</span><input id="search" type="search" placeholder="搜索房间号或玩家编号" aria-label="搜索房间号或玩家编号"></label></div>
+  <div id="rooms"></div>
+ </section>
+ <footer>流量为应用层消息收发量，速率为最近 5 秒平均值；不含 TCP、TLS 和握手开销。计费流量以云服务商控制台为准。<br>当前页面展示运行中的房间，服务重启后统计重新开始。</footer>
+</main>
+<dialog id="login-dialog"><form id="login-form"><p class="eyebrow">PRIVATE ACCESS</p><h2>登录管理后台</h2><p class="subtle">使用部署时配置的管理密钥。请通过 HTTPS 或 SSH 隧道访问。</p><label for="admin-token">管理密钥</label><input id="admin-token" type="password" autocomplete="off" required placeholder="输入管理密钥"><p id="login-error" class="error" role="alert"></p><button id="login-submit" class="primary" type="submit">进入控制台 →</button><p class="login-note">密钥不会保存在浏览器本地存储中。</p></form></dialog>
+<dialog id="confirm-dialog"><form id="confirm-form"><p class="eyebrow">ROOM ACTION</p><h2 id="confirm-title"></h2><p id="confirm-detail" class="subtle"></p><p id="confirm-error" class="error" role="alert"></p><div class="dialog-actions"><button id="cancel-action" type="button" class="secondary">取消</button><button id="confirm-action" class="danger" type="submit">确认操作</button></div></form></dialog>
+</body></html>

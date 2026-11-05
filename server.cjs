@@ -8,6 +8,8 @@ const {enqueueCommand}=require('./movement-queue.cjs');
 const {attach}=require('./room-websocket.cjs');
 const {decodeWorldInput}=require('./world-upload.cjs');
 const {CapacityGuard}=require('./capacity.cjs');
+const {RoomTraffic}=require('./room-traffic.cjs');
+const {createAdmin}=require('./admin.cjs');
 const networkMode=process.env.WEEDING_MODE||'local';
 if(!['local','online'].includes(networkMode))throw Error('WEEDING_MODE must be local or online');
 const capacity=new CapacityGuard(Object.fromEntries([['maxRooms','WEEDING_MAX_ROOMS'],['maxPlayers','WEEDING_MAX_PLAYERS'],['maxRssMb','WEEDING_MAX_RSS_MB'],['maxCpu','WEEDING_MAX_CPU_PERCENT'],['maxLagMs','WEEDING_MAX_LAG_MS']].filter(([,name])=>process.env[name]!==undefined).map(([key,name])=>[key,Number(process.env[name])])));
@@ -15,6 +17,7 @@ let shuttingDown=false;
 const snapshots=new SnapshotArchive();
 const requestCounts = new Map();
 const rooms = new Map();
+const revokedTokens=new Map();
 const port = Number(process.env.WEEDING_PORT || 8788);
 function key() { return crypto.randomBytes(24).toString('hex'); }
 function failure(message,code) { const error=new Error(message);error.code=code;throw error; }
@@ -28,23 +31,26 @@ function fullWorld(room,code,support){
  return support&&Buffer.byteLength(world)>65536?{snapshot:snapshots.describe(code,world,room.revision)}:{world};
 }
 function authorized(room, token) {
+  const revoked=revokedTokens.get(token);if(revoked&&revoked.until>Date.now())failure(revoked.message,'SESSION_ENDED');
   if (!room || Date.now() - room.lastHost > 15000) failure('房主已离线');
   if (token !== room.host && !room.guests.has(token)) failure('房间身份无效');
 }
 const server = http.createServer(async (req, res) => {
+  if(await admin(req,res))return;
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   requestCounts.set(req.url, (requestCounts.get(req.url) || 0) + 1);
   if(req.method==='GET' && req.url==='/diagnostics') {
+    if(networkMode==='online'){res.statusCode=403;res.end(JSON.stringify({ok:false,error:'请登录管理后台查看房间诊断'}));return;}
     res.end(JSON.stringify({rooms:[...rooms].map(([code,room])=>({
       room:code,host:room.metrics||null,hostHeartbeatAgeMs:Date.now()-room.lastHost,
       guests:[...room.guests.values()].map(guest=>guest.metrics||null)
     }))}));return;
   }
   if(req.method==='GET' && req.url==='/health') {
-    res.end(JSON.stringify({ok:!shuttingDown,protocol:10,networkMode,rooms:rooms.size,capacity:{...population(),limits:capacity.limits,metrics:capacity.metrics,overloaded:capacity.overloaded,shuttingDown},requests:Object.fromEntries(requestCounts)}));return;
+    res.end(JSON.stringify({ok:!shuttingDown,protocol:10,economySupport:true,networkMode,rooms:rooms.size,capacity:{...population(),limits:capacity.limits,metrics:capacity.metrics,overloaded:capacity.overloaded,shuttingDown},requests:Object.fromEntries(requestCounts)}));return;
   }
   if(req.method==='GET' && req.url==='/debug.rpk') {
     const file=path.resolve(__dirname,'../../../VivoDebug/webgl_vivo/dist/com.application.demo.minigame.rpk');
@@ -68,6 +74,10 @@ const server = http.createServer(async (req, res) => {
     }
     const raw=Buffer.concat(chunks).toString('utf8');
     const data = JSON.parse(raw);
+    if(!data||typeof data!=='object'||Array.isArray(data))failure('请求必须是 JSON 对象','INVALID_REQUEST');
+    if(!req.internalRoomTransport){
+      const end=res.end.bind(res);res.end=function(body,...args){const code=req.trafficRoom||data.room;recordRoomTraffic(code,bytes,body==null?0:Buffer.byteLength(body));return end(body,...args);};
+    }
     if(shuttingDown&&req.url!=='/close')failure('服务器已关闭，已返回离线模式','SERVER_SHUTDOWN');
     let room = rooms.get(data.room);
     let result = {};
@@ -81,11 +91,13 @@ const server = http.createServer(async (req, res) => {
       case '/create': {
         admit('create',data);
         if(data.protocol!==10)failure('游戏版本不匹配，请更新游戏后重新开房（房间协议10）');
+        const initialState=new RoomWorld(decodeWorldInput(data));
+        if(initialState.data.economy?.shared===false&&!data.economySupport)failure('独立经济房间需要更新客户端','ECONOMY_CLIENT_REQUIRED');
         let code;
         do { code = String(crypto.randomInt(100000, 1000000)); } while (rooms.has(code));
-        room = { host: key(), playerId:String(data.playerId||'host').slice(0,64),activeSeconds:0,salt: data.salt, hash: data.hash, guests: new Map(), pose: null,
-          state:new RoomWorld(decodeWorldInput(data)), revision:1, history:[], commandSequence:0, commandKeys:new Set(), commands: [], lastHost: Date.now() };
-        rooms.set(code, room);
+        room = { createdAt:Date.now(),traffic:new RoomTraffic(), host: key(), playerId:String(data.playerId||'host').slice(0,64),activeSeconds:0,salt: data.salt, hash: data.hash, guests: new Map(), pose: null,
+          state:initialState, revision:1, history:[], commandSequence:0, commandKeys:new Set(), commands: [], lastHost: Date.now() };
+        rooms.set(code, room);req.trafficRoom=code;
         result = { room: code, token: room.host };
         break;
       }
@@ -93,11 +105,12 @@ const server = http.createServer(async (req, res) => {
         admit('join',data);
         if(data.protocol!==10)failure('游戏版本不匹配，请更新游戏后加入房间（房间协议10）');
         if (!room || Date.now() - room.lastHost > 15000) failure('房间不存在或房主已离线');
+        if(room.state.data.economy?.shared===false&&!data.economySupport)failure('该房间未共享经济，请更新客户端后加入','ECONOMY_CLIENT_REQUIRED');
         if (room.guests.size >= 3) failure('房间已满');
         const hash = crypto.pbkdf2Sync(data.password || '', Buffer.from(room.salt, 'base64'), 10000, 32, 'sha1');
         if (!crypto.timingSafeEqual(hash, Buffer.from(room.hash, 'base64'))) failure('密码错误');
         const worldReply=fullWorld(room,data.room,data.snapshotSupport);
-        const token = key(); room.guests.set(token, { id: key().slice(0,8), playerId:String(data.playerId||key()).slice(0,64),activeSeconds:0,seen: Date.now(), pose: null });
+        const token = key(); room.guests.set(token, { id: key().slice(0,8), playerId:String(data.playerId||key()).slice(0,64),activeSeconds:0,joinedAt:Date.now(),seen: Date.now(), pose: null });
         result = { room: data.room, token, self:room.guests.get(token).id, ...worldReply, revision:room.revision };
         break;
       }
@@ -137,7 +150,7 @@ const server = http.createServer(async (req, res) => {
               sectionMask|=patch.sections||0;
               // Omitted sections mean unchanged. Keep the last supplied value of
               // each section across the entire gap, including explicit empty lists.
-              for(const name of ['bundles','progress','tools','areas'])
+              for(const name of ['bundles','progress','tools','areas','economy'])
                 if(patch[name]!=null)sections[name]=patch[name];
               // A full inventory is a fresh baseline. Earlier changes are already
               // represented by it; later content and pose operations stay ordered.
@@ -195,13 +208,25 @@ const server = http.createServer(async (req, res) => {
         if(token!==data.token && guest.pose && Date.now()-guest.seen<15000) result.peers.push({id:guest.id,playerId:guest.playerId,activeSeconds:guest.activeSeconds,...guest.pose});
     }
     if(['/create','/join','/close'].includes(req.url))console.log(new Date().toISOString(),req.socket.remoteAddress,req.url,'ok');
-    res.end(JSON.stringify({ ok: true, protocol:10, networkMode, ...result }));
+    res.end(JSON.stringify({ ok: true, protocol:10, economySupport:true, networkMode, ...result }));
   } catch (error) {
     console.log(new Date().toISOString(),req.socket.remoteAddress,req.url,error.message);
     // Game errors stay in JSON because some mini-game transports discard HTTP error bodies.
     res.statusCode = 200; res.end(JSON.stringify({ ok: false, error: error.message, code:error.code }));
   }
 });
+function recordRoomTraffic(code,received,sent){rooms.get(code)?.traffic?.add(received,sent);}
+server.on('room-traffic',recordRoomTraffic);
+function revokeRoomMember(code,token,message){
+ revokedTokens.set(token,{message,until:Date.now()+60000});
+ server.emit('room-notice',{room:code,token,body:{ok:false,code:'SESSION_ENDED',error:message}});
+}
+const admin=createAdmin({
+ state:()=>({server:{protocol:10,networkMode,startedAt:serverStartedAt,...population(),limits:capacity.limits,metrics:capacity.metrics,overloaded:capacity.overloaded,shuttingDown},rooms:[...rooms].map(([code,room])=>({code,createdAt:room.createdAt,ageSeconds:Math.max(0,Math.floor((Date.now()-room.createdAt)/1000)),economyShared:room.state.data.economy?.shared!==false,host:{id:'host',playerId:room.playerId,heartbeatAgeMs:Date.now()-room.lastHost},guests:[...room.guests.values()].map(guest=>({id:guest.id,playerId:guest.playerId,joinedAt:guest.joinedAt,heartbeatAgeMs:Date.now()-guest.seen})),traffic:room.traffic.snapshot()}))}),
+ kick:(code,actor,createdAt)=>{const room=rooms.get(code);if(!room||room.createdAt!==createdAt||typeof actor!=='string'||actor==='host')return false;const member=[...room.guests].find(([,g])=>g.id===actor);if(!member)return false;room.guests.delete(member[0]);room.commands=room.commands.filter(c=>c.actor!==actor);revokeRoomMember(code,member[0],'你已被管理员移出房间，已返回离线模式');return true;},
+ close:(code,createdAt)=>{const room=rooms.get(code);if(!room||room.createdAt!==createdAt)return false;revokeRoomMember(code,room.host,'管理员已关闭房间，已返回离线模式');for(const token of room.guests.keys())revokeRoomMember(code,token,'管理员已关闭房间，已返回离线模式');rooms.delete(code);snapshots.drop(code);return true;}
+});
+const serverStartedAt=Date.now();
 server.listen(port, '0.0.0.0', () => console.log('Weeding LAN relay listening on ' + port));
 if(process.env.WEEDING_DISABLE_WS!=='1')attach(server,{authorizeSubscription:(code,token)=>!!rooms.get(code)?.guests.has(token)});
 let previousCpu=process.cpuUsage(),previousTime=performance.now();
@@ -214,6 +239,7 @@ function beginShutdown(){
 process.on('SIGTERM',beginShutdown);process.on('SIGINT',beginShutdown);
 module.exports={beginShutdown};
 setInterval(() => {
+  for(const [token,entry] of revokedTokens)if(entry.until<Date.now())revokedTokens.delete(token);
   for (const [code, room] of rooms) {
     if (Date.now() - room.lastHost > 15000){rooms.delete(code);snapshots.drop(code);}
     for(const [token,guest] of room.guests)if(Date.now()-guest.seen>15000)room.guests.delete(token);

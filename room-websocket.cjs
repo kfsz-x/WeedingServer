@@ -6,11 +6,11 @@ function attach(server,{authorizeSubscription=()=>false,maxPayload=16*1024*1024}
  const wss=new WebSocketServer({noServer:true,maxPayload,perMessageDeflate:false});
  const dispatch=(socket,path,body,internalRoomPush=false)=>new Promise((resolve,reject)=>{
   const timer=setTimeout(()=>reject(new Error('Request timed out')),10000);timer.unref();
-  const req={method:'POST',url:path,socket:socket._socket,internalRoomPush,async *[Symbol.asyncIterator](){yield Buffer.from(JSON.stringify(body));}};
+  const req={method:'POST',url:path,socket:socket._socket,internalRoomPush,internalRoomTransport:true,async *[Symbol.asyncIterator](){yield Buffer.from(JSON.stringify(body));}};
   const res={statusCode:200,setHeader(){},writeHead(status){this.statusCode=status;},end(body){clearTimeout(timer);resolve({status:this.statusCode,body:String(body||'')});}};
   try{server.emit('request',req,res);}catch(e){clearTimeout(timer);reject(e);}
  });
- function send(socket,message){if(socket.readyState!==WebSocket.OPEN)return;if(socket.bufferedAmount>maxPayload){socket.close(1013,'Backpressure');return;}socket.send(JSON.stringify(message));}
+ function send(socket,message,room){if(socket.readyState!==WebSocket.OPEN)return;if(socket.bufferedAmount>maxPayload){socket.close(1013,'Backpressure');return;}const wire=JSON.stringify(message);socket.send(wire);server.emit('room-traffic',room||socket.roomIdentity?.room,0,Buffer.byteLength(wire));}
  function upgrade(req,socket,head){if(req.url!=='/room-ws'){socket.destroy();return;}wss.handleUpgrade(req,socket,head,ws=>wss.emit('connection',ws,req));}
  server.on('upgrade',upgrade);
  wss.on('connection',socket=>{
@@ -20,7 +20,9 @@ function attach(server,{authorizeSubscription=()=>false,maxPayload=16*1024*1024}
   socket.on('message',async(raw,binary)=>{
    let msg;try{msg=JSON.parse(raw.toString());if(binary||!msg||typeof msg.id!=='string'||msg.id.length>80||!ROUTES.has(msg.path)||!msg.body||typeof msg.body!=='object')throw Error('Invalid request');}catch(e){send(socket,{type:'response',id:msg&&msg.id,status:400,body:JSON.stringify({ok:false,error:'Invalid request'})});return;}
    if(socket.pending>=8){socket.close(1013,'Too many requests');return;}socket.pending++;
-   try{const reply=await dispatch(socket,msg.path,msg.body);send(socket,{type:'response',id:msg.id,...reply});
+   try{const reply=await dispatch(socket,msg.path,msg.body);const result=JSON.parse(reply.body),code=result.room||msg.body.room||socket.roomIdentity?.room;
+    if(result.ok&&['/create','/join','/host','/poll'].includes(msg.path))socket.roomIdentity={room:code,token:result.token||msg.body.token};
+    server.emit('room-traffic',code,raw.length,0);send(socket,{type:'response',id:msg.id,...reply},code);
     if(msg.path==='/poll'){const result=JSON.parse(reply.body);if(result.ok&&authorizeSubscription(msg.body.room,msg.body.token))socket.subscription={...msg.body,revision:result.revision};else socket.subscription=null;}
     if(['/join','/create','/close'].includes(msg.path))socket.subscription=null;
    }catch(e){send(socket,{type:'response',id:msg.id,status:500,body:JSON.stringify({ok:false,error:'Request failed'})});}finally{socket.pending--;}
@@ -37,7 +39,9 @@ function attach(server,{authorizeSubscription=()=>false,maxPayload=16*1024*1024}
  server.on('room-updated',updated);
  const shutdown=()=>{for(const socket of wss.clients)send(socket,{type:'push',status:200,body:JSON.stringify({ok:false,code:'SERVER_SHUTDOWN',error:'服务器已关闭，已返回离线模式'})});};
  const stop=()=>{for(const socket of wss.clients)socket.close(1001,'Server shutdown');};
+ const notice=event=>{for(const socket of wss.clients)if(socket.roomIdentity?.room===event.room&&socket.roomIdentity?.token===event.token){send(socket,{type:'push',status:200,body:JSON.stringify(event.body)},event.room);socket.subscription=null;const timer=setTimeout(()=>{if(socket.roomIdentity?.token===event.token)socket.close(1008,'Session ended');},1000);timer.unref();}};
+ server.on('room-notice',notice);
  server.on('server-shutdown',shutdown);server.on('shutdown-sockets',stop);
- return {close(){server.off('server-shutdown',shutdown);server.off('shutdown-sockets',stop);server.off('upgrade',upgrade);server.off('room-updated',updated);for(const socket of wss.clients)socket.terminate();wss.close();}};
+ return {close(){server.off('room-notice',notice);server.off('server-shutdown',shutdown);server.off('shutdown-sockets',stop);server.off('upgrade',upgrade);server.off('room-updated',updated);for(const socket of wss.clients)socket.terminate();wss.close();}};
 }
 module.exports={attach};
